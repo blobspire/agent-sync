@@ -1,0 +1,8 @@
+{
+  "format": 1,
+  "ignore": [],
+  "only": {},
+  "notify": null,
+  "notify_after_hours": 6,
+  "max_file_mb": 5
+}
