@@ -68,10 +68,12 @@ def _load(path: Path) -> dict:
     """A settings source: missing means empty, but a broken file is an error. Treating it as empty would
     silently drop every shared setting (permissions and hooks included) on every machine."""
     try:
-        data = jsonutil.load(path, {}) or {}
+        data = jsonutil.load(path, None)
     except ValueError as exc:
         raise Unreadable(path, str(exc))
-    if not isinstance(data, dict):
+    if data is None:
+        return {}
+    if not isinstance(data, dict):  # checked before any truthiness test: `[]` must not pass as `{}`
         raise Unreadable(path, "top level is not an object")
     return data
 
@@ -154,7 +156,12 @@ def split_secrets(obj: dict, path: Tuple[str, ...] = ()) -> Tuple[dict, dict]:
 
 def effective(ctx: Context) -> dict:
     """This host's settings in placeholder form (base + overlay), without local secrets or the hook."""
-    return jsonutil.merge(_load(base_path(ctx)), ctx.hostfile.get("settings", {}) or {})
+    overlay = ctx.hostfile.get("settings", {})
+    if overlay is None:
+        overlay = {}
+    if not isinstance(overlay, dict):  # a list here would replace every setting
+        raise Unreadable(ctx.hostfile_path, '"settings" must be a JSON object')
+    return jsonutil.merge(_load(base_path(ctx)), overlay)
 
 
 def generate(ctx: Context, local: Optional[dict] = None) -> dict:

@@ -94,12 +94,14 @@ class Git:
             return []
         return [l for l in self.out("ls-tree", "-r", "--name-only", "HEAD").splitlines() if l]
 
-    def gitlinks(self) -> List[str]:
-        """Staged paths that are nested git repositories (mode 160000), which git stores as empty links."""
+    def staged_gitlinks(self) -> List[str]:
+        """Paths this commit would add or change into nested git repositories (mode 160000), which git
+        stores as empty links. Gitlinks already in HEAD are not reported again."""
         out = []
-        for line in self.out("ls-files", "-s").splitlines():
+        for line in self.out("diff", "--cached", "--raw", "--no-renames").splitlines():
             meta, _, path = line.partition("\t")
-            if meta.startswith("160000"):
+            fields = meta.split()
+            if len(fields) >= 5 and fields[1] == "160000" and fields[4][:1] in "AMT":
                 out.append(path)
         return out
 
@@ -140,13 +142,13 @@ class Git:
     def fetch(self) -> None:
         self.run("fetch", "-q", "origin", timeout=NETWORK_TIMEOUT)
 
-    def rebase_onto_remote(self, branch: str) -> Optional[List[str]]:
+    def rebase_onto_remote(self, branch: str, fork_point: bool = False) -> Optional[List[str]]:
         """Rebase local commits onto origin/<branch>. Returns conflicted paths (rebase aborted) or None.
 
-        --fork-point (what `git pull --rebase` does) uses the remote-tracking reflog, so commits that were
-        already pushed and then removed from the remote by a history rewrite are not replayed and re-pushed.
+        fork_point: drop commits the remote's rewritten history no longer has, instead of replaying them.
         """
-        result = self.run("rebase", "-q", "--fork-point", f"origin/{branch}", check=False, timeout=NETWORK_TIMEOUT)
+        args = ["rebase", "-q"] + (["--fork-point"] if fork_point else []) + [f"origin/{branch}"]
+        result = self.run(*args, check=False, timeout=NETWORK_TIMEOUT)
         if result.returncode == 0:
             return None
         conflicted = self.run("diff", "--name-only", "--diff-filter=U", check=False).stdout.split()

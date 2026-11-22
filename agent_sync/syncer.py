@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import traceback
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from . import claudemd, jsonutil, links, scan, settings
 from .context import KINDS, AgentSyncError, Context
@@ -142,19 +142,25 @@ def outgoing_issues(git: Git, pairs: List[Tuple[str, str]], allow_deletes: bool,
     bad_json = []
     for status, path in pairs:
         own = path == "agent-sync.json" or (path.endswith(".json") and path.split("/")[0] in ("settings", "hosts"))
-        if status != "D" and own:
+        if own and status == "D" and path in ("agent-sync.json", "settings/base.json"):
+            bad_json.append(f"{path} (deleted; it holds settings for every machine)")
+        elif own and status != "D":
             try:
-                json.loads((git.repo / path).read_text(encoding="utf-8") or "{}")
+                text = (git.repo / path).read_text(encoding="utf-8")
+                if text.strip() and not isinstance(json.loads(text), dict):
+                    bad_json.append(f"{path} (must be a JSON object)")
             except (ValueError, OSError) as exc:
                 bad_json.append(f"{path} ({exc})")
     if bad_json:
         issues.append("invalid JSON: " + "; ".join(bad_json))
 
-    nested = git.gitlinks()
+    nested = git.staged_gitlinks()
     if nested:
+        repo = "~/.claude/agent-config"
         issues.append(
             "folders with their own .git (they'd sync as empty submodules): " + ", ".join(nested[:5])
-            + ". Delete their .git folder to share them as plain files"
+            + f". To share them as plain files: `git -C {repo} rm -r -q --cached <path>`, delete <path>/.git, "
+            "then run agent-sync"
         )
 
     if not allow_deletes:
@@ -197,12 +203,14 @@ def _reload(ctx: Context, st: State) -> bool:
 def _open_repo_problem(ctx: Context, st: State) -> None:
     st.open_problem(
         "repo",
-        f"{ctx.load_error} Until it's fixed this machine only fetches, so a fix pushed from any machine still lands here.",
+        f"{ctx.load_error} Until it's fixed this machine doesn't commit or push; a fix pushed from another "
+        "machine still lands here.",
         f"Fix it in {ctx.paths.tilde(ctx.paths.repo_link)} and run `agent-sync`.",
     )
 
 
-def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_large: bool = False) -> int:
+def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_large: bool = False,
+         accept_rewrite: bool = False) -> int:
     with lock(ctx.paths.state_dir, wait=not quiet) as got:
         if not got:
             if not quiet:
@@ -213,9 +221,9 @@ def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_l
         failed = False
         try:
             if ctx.load_error:
-                _recover(ctx, st, lines)
+                _recover(ctx, st, lines, accept_rewrite)
             if not ctx.load_error:
-                _sync(ctx, st, lines, allow_deletes, allow_large)
+                _sync(ctx, st, lines, allow_deletes, allow_large, accept_rewrite)
             st.close_problem("error")
         except Exception as exc:  # any failure must become a visible problem, never a silent crash
             failed = True
@@ -246,23 +254,16 @@ def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_l
         return 1 if failed else 0
 
 
-def _recover(ctx: Context, st: State, lines: List[str]) -> None:
-    """The repo's own config files don't load: only fetch and fast-forward, hoping a fix arrives."""
+def _recover(ctx: Context, st: State, lines: List[str], accept_rewrite: bool) -> None:
+    """The repo's own config files don't load: never commit or push, only take in what the remote has,
+    so a fix made on another machine heals this one."""
     _open_repo_problem(ctx, st)
     git = Git(ctx.repo, ctx.git_name, ctx.git_email)
-    if git.busy() or not git.has_remote() or git.dirty():
+    if git.busy() or not git.has_remote():
         return
-    git.fetch()
-    branch = git.branch()
-    _, behind = git.ahead_behind(branch)
-    if not behind:
-        return
-    conflicted = git.rebase_onto_remote(branch)
-    if conflicted:
-        _open_conflict(ctx, st, conflicted)
-        return
-    lines.append(f"pulled {behind} change(s)")
-    _reload(ctx, st)
+    _clear_stale_index_lock(ctx, git, lines)
+    if _exchange(ctx, st, git, lines, accept_rewrite, recovering=True):
+        _reload(ctx, st)
 
 
 def _clear_stale_index_lock(ctx: Context, git: Git, lines: List[str]) -> None:
@@ -275,7 +276,8 @@ def _clear_stale_index_lock(ctx: Context, git: Git, lines: List[str]) -> None:
         pass
 
 
-def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_large: bool) -> None:
+def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_large: bool,
+          accept_rewrite: bool) -> None:
     git = Git(ctx.repo, ctx.git_name, ctx.git_email)
     backups = Backups(ctx.paths.state_dir, ctx.paths.claude)
 
@@ -313,6 +315,38 @@ def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_
     if not git.has_remote():
         st.data["last_ok"] = now()
         return
+    incoming = _exchange(ctx, st, git, lines, accept_rewrite, recovering=False)
+    if incoming is None:
+        return
+    if incoming and not _reload(ctx, st):
+        return
+    st.data["last_ok"] = now()
+    st.data.pop("last_error", None)
+
+    # 3. Install whatever came in.
+    if incoming:
+        lines += apply(ctx, st, backups)
+
+
+def _rewritten_away(git: Git, branch: str) -> List[str]:
+    """Commits this machine has that the remote once had and no longer does: its history was rewritten.
+
+    The fork point (from the remote-tracking reflog) is past the merge base exactly when commits that were
+    on origin have since been removed from it, by a deliberate purge or by a force-push from a stale clone.
+    """
+    fork = git.run("merge-base", "--fork-point", f"origin/{branch}", "HEAD", check=False)
+    if fork.returncode != 0 or not fork.stdout.strip():
+        return []
+    base = git.run("merge-base", f"origin/{branch}", "HEAD", check=False).stdout.strip()
+    if not base or fork.stdout.strip() == base:
+        return []
+    return git.out("rev-list", "--oneline", f"{base}..{fork.stdout.strip()}").splitlines()
+
+
+def _exchange(ctx: Context, st: State, git: Git, lines: List[str], accept_rewrite: bool,
+              recovering: bool) -> Optional[bool]:
+    """Fetch, then pull and push. Returns whether anything came in, or None when syncing had to stop
+    (the reason is recorded as a problem). While recovering, only fast-forward; never push."""
     try:
         git.fetch()
     except GitError as exc:
@@ -321,58 +355,65 @@ def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_
         if not st.data.get("last_ok"):
             st.open_problem(
                 "remote",
-                f"This machine has never reached its remote ({git.remote_url()}): {exc}.",
+                f"This machine has never reached its remote: {exc}.",
                 f"Check the URL (`git -C {ctx.paths.tilde(ctx.paths.repo_link)} remote -v`) and git credentials.",
             )
-        return
+        return None
     st.close_problem("remote")
     branch = git.branch()
-    ahead, behind = git.ahead_behind(branch)
-    incoming = bool(behind)
-    if (ahead or behind) and git.remote_branch_exists(branch):
-        # Also when only ahead: if the remote's history was rewritten (say, to purge a leaked secret),
-        # commits this machine already pushed now look "ahead"; the fork-point rebase drops them.
-        before = git.out("rev-parse", "HEAD")
-        conflicted = git.rebase_onto_remote(branch)
-        if conflicted:
-            _open_conflict(ctx, st, conflicted)
-            return
-        if behind:
-            lines.append(f"pulled {behind} change(s)")
-        incoming = incoming or git.out("rev-parse", "HEAD") != before
-        if incoming and not _reload(ctx, st):
-            return
-    st.close_problem("conflict")
-
-    ahead, _ = git.ahead_behind(branch)
-    if ahead:
-        for _attempt in range(3):
-            try:
-                if git.push(branch):
-                    lines.append(f"pushed {ahead} commit(s)")
-                    st.close_problem("push")
-                    break
-            except GitError as exc:
-                st.open_problem("push", f"Couldn't push to the remote: {exc}.", "Check git credentials for the remote.")
-                return
-            git.fetch()
-            conflicted = git.rebase_onto_remote(branch)
+    incoming = False
+    for _attempt in range(3):
+        dropped = _rewritten_away(git, branch)
+        if dropped and not accept_rewrite:
+            repo = ctx.paths.tilde(ctx.paths.repo_link)
+            st.open_problem(
+                "rewrite",
+                f"The remote's history was rewritten (force-pushed): {len(dropped)} commit(s) this machine already "
+                f"synced are no longer on it ({'; '.join(dropped[:3])}). Syncing is paused so nothing is lost or "
+                "pushed back by mistake.",
+                f"If the rewrite was deliberate (say, purging a secret), run `agent-sync --accept-rewrite` to drop "
+                f"them here too. If it was a mistake, restore them: `cd {repo} && git rebase origin/{branch}`, "
+                "then `agent-sync`.",
+            )
+            return None
+        if dropped:
+            conflicted = git.rebase_onto_remote(branch, fork_point=True)
             if conflicted:
                 _open_conflict(ctx, st, conflicted)
-                return
+                return None
+            lines.append(f"dropped {len(dropped)} commit(s) the remote's rewritten history no longer has")
             incoming = True
-            if not _reload(ctx, st):
-                return
-            ahead, _ = git.ahead_behind(branch)
-        else:
-            st.open_problem("push", "The remote kept moving while pushing; will retry next run.")
-            return
-    st.data["last_ok"] = now()
-    st.data.pop("last_error", None)
+        st.close_problem("rewrite")
 
-    # 3. Install whatever came in.
-    if incoming:
-        lines += apply(ctx, st, backups)
+        ahead, behind = git.ahead_behind(branch)
+        if behind:
+            if recovering:
+                if ahead or git.run("merge", "--ff-only", "-q", f"origin/{branch}", check=False).returncode != 0:
+                    lines.append("couldn't fast-forward to the remote yet (local commits or overlapping edits)")
+                    return incoming
+            else:
+                conflicted = git.rebase_onto_remote(branch)
+                if conflicted:
+                    _open_conflict(ctx, st, conflicted)
+                    return None
+            lines.append(f"pulled {behind} change(s)")
+            incoming = True
+            ahead, _ = git.ahead_behind(branch)
+        if not recovering:
+            st.close_problem("conflict")
+        if recovering or not ahead:
+            return incoming
+        try:
+            if git.push(branch):
+                lines.append(f"pushed {ahead} commit(s)")
+                st.close_problem("push")
+                return incoming
+        except GitError as exc:
+            st.open_problem("push", f"Couldn't push to the remote: {exc}.", "Check git credentials for the remote.")
+            return None
+        git.fetch()  # someone pushed first: integrate and try again
+    st.open_problem("push", "The remote kept moving while pushing; will retry next run.")
+    return None
 
 
 def _open_conflict(ctx: Context, st: State, files: List[str]) -> None:

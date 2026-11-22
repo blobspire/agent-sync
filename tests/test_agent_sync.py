@@ -587,6 +587,13 @@ class ReviewFixes(Base):
         o.git("push", "-q", "--force", "origin", "HEAD:main")
         self.b.run()
         self.a.run()
+        self.assertNotIn("creds.txt", self.remote_files())  # nobody pushed it back
+        self.assertIn("rewrite", self.problems(self.b))
+        self.assertIn("--accept-rewrite", self.b.hook())
+        for m in (self.a, self.b):
+            m.run("--accept-rewrite")
+            self.assertNotIn("rewrite", self.problems(m))
+            self.assertFalse((m.repo / "skills/foo/creds.txt").exists())
         self.assertNotIn("creds.txt", self.remote_files())
 
     # filesystem ----------------------------------------------------------------------------------
@@ -758,6 +765,159 @@ class ReviewFixes(Base):
         self.b.run()
         self.assertNotIn("effortLevel", self.b.hostfile().get("settings", {}))
         self.assertEqual(self.b.settings()["effortLevel"], "high")
+
+
+
+class ReviewFixesRound2(Base):
+    """Regression pins for what the second review found in the round-1 fixes."""
+
+    def problems(self, m: Machine) -> dict:
+        return m.state()["problems"]
+
+    def remote_show(self, path: str) -> str:
+        return subprocess.run(["git", "-C", str(self.remote), "show", f"main:{path}"],
+                              capture_output=True, text=True).stdout
+
+    def case_sensitive(self) -> bool:
+        (self.tmp / "CaseCheck").write_text("")
+        return not (self.tmp / "casecheck").exists()
+
+    # the exchange --------------------------------------------------------------------------------
+
+    def test_force_push_from_a_stale_clone_does_not_silently_drop_pushed_work(self):
+        o = self.outsider()  # cloned before the new skill exists
+        self.a.write(".claude/skills/newskill/SKILL.md", "new\n", old=True)
+        self.a.run()
+        self.assertIn("skills/newskill/SKILL.md", self.remote_files())
+        o.write(".local/share/agent-config/notes/x.md", "x\n")
+        self.push_as_outsider(o, "stale clone", force=True)
+        self.a.run()
+        self.assertIn("rewrite", self.problems(self.a))
+        self.assertTrue((self.a.claude / "skills/newskill/SKILL.md").exists())
+        self.a.git("rebase", "-q", "origin/main")  # the hint's "it was a mistake" path
+        self.a.run()
+        self.assertIn("skills/newskill/SKILL.md", self.remote_files())
+        self.assertIn("notes/x.md", self.remote_files())
+        self.assertNotIn("rewrite", self.problems(self.a))
+
+    def test_conflict_resolved_with_a_merge_commit_is_pushed(self):
+        self.a.write(".claude/commands/hello.md", "A version\n")
+        self.b.write(".claude/commands/hello.md", "B version\n")
+        self.a.run()
+        self.b.run()
+        self.assertIn("conflict", self.problems(self.b))
+        self.b.git("pull", "-q", "--no-rebase", "origin", "main", ok=False)
+        (self.b.repo / "commands/hello.md").write_text("merged\n")
+        self.b.git("add", "-A")
+        self.b.git("commit", "-q", "-m", "merge")
+        self.b.run()
+        self.assertNotIn("conflict", self.problems(self.b))
+        self.assertEqual(self.remote_show("commands/hello.md"), "merged\n")
+
+    def test_recovery_fast_forwards_even_with_local_edits(self):
+        o = self.outsider()
+        good = (o.repo / "agent-sync.json").read_text()
+        (o.repo / "agent-sync.json").write_text('{"format": 1,}')
+        self.push_as_outsider(o, "broken manifest")
+        self.b.run()
+        self.assertIn("repo", self.problems(self.b))
+        self.b.write(".claude/skills/foo/SKILL.md", "b edited while broken\n")  # dirty tree
+        (o.repo / "agent-sync.json").write_text(good)
+        self.push_as_outsider(o, "fix manifest")
+        self.b.run()
+        self.assertNotIn("repo", self.problems(self.b))
+        self.assertIn("b edited while broken", self.remote_show("skills/foo/SKILL.md"))
+
+    def test_gitlink_already_in_history_does_not_hold_later_syncs(self):
+        o = self.outsider()
+        sha = o.git("rev-parse", "HEAD").stdout.strip()
+        o.git("update-index", "--add", "--cacheinfo", f"160000,{sha},skills/oldlink")
+        o.git("commit", "-q", "-m", "gitlink from an older agent-sync")
+        o.git("push", "-q", "origin", "HEAD:main")
+        self.a.run()
+        self.a.write(".claude/skills/foo/SKILL.md", "after the gitlink\n")
+        self.a.run()
+        self.assertNotIn("held", self.problems(self.a))
+        self.assertIn("after the gitlink", self.remote_show("skills/foo/SKILL.md"))
+
+    def test_new_gitlink_staged_directly_in_the_repo_is_held(self):
+        nested = self.a.repo / "skills/cloned2"
+        nested.mkdir()
+        (nested / "SKILL.md").write_text("cloned2\n")
+        mail = "t" + "@" + "example.com"
+        env = dict(self.a.env, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL=mail,
+                   GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL=mail)
+        for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "x"]):
+            subprocess.run(["git", "-C", str(nested), *cmd], check=True, env=env, capture_output=True)
+        self.a.run()
+        self.assertIn("held", self.problems(self.a))
+        self.assertIn("rm -r -q --cached", self.a.hook())
+        self.assertNotIn("skills/cloned2", self.remote_files())
+
+    # own JSON ------------------------------------------------------------------------------------
+
+    def test_base_json_that_is_not_an_object_or_is_deleted_is_held(self):
+        (self.a.repo / "settings/base.json").write_text("[]")
+        self.a.run()
+        self.assertIn("held", self.problems(self.a))
+        (self.a.repo / "settings/base.json").unlink()
+        self.a.run()
+        self.assertIn("deleted", self.a.hook())
+        self.assertIn("{}", self.remote_show("settings/base.json"))
+
+    def test_host_settings_that_are_not_an_object_leave_settings_alone(self):
+        before = self.b.settings()
+        o = self.outsider()
+        (o.repo / "hosts/b.json").write_text(json.dumps({"settings": []}))
+        self.push_as_outsider(o, "bad overlay")
+        self.b.run()
+        self.assertEqual(self.b.settings(), before)
+        self.assertIn("settings", self.problems(self.b))
+
+    # setup ---------------------------------------------------------------------------------------
+
+    def test_init_refuses_without_identity_before_cloning(self):
+        c = Machine(self.tmp, "c")
+        r = c.run("init", self.url, "--host", "c", ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(c.repo.exists())
+
+    # secrets -------------------------------------------------------------------------------------
+
+    def test_secret_named_settings_without_a_token_shape_stay_local(self):
+        s = self.a.settings()
+        s["env"]["SECRET_KEY"] = "django-insecure-k#9x!m@2p$q(r)s&t*u"
+        s["env"]["DB_PASSWORD_PROD"] = "Tr0ub4dor&3"
+        self.a.set_settings(s)
+        self.a.run()
+        self.assertNotIn("Tr0ub4dor", self.remote_show("hosts/a.json"))
+        self.assertNotIn("django-insecure", json.dumps(self.a.hostfile()))
+        self.assertEqual(self.a.settings()["env"]["DB_PASSWORD_PROD"], "Tr0ub4dor&3")
+
+    # names that differ only in case --------------------------------------------------------------
+
+    def test_case_only_rename_of_a_shared_skill_keeps_syncing(self):
+        self.a.git("mv", "skills/foo", "skills/foo-tmp")  # two steps: macOS can't rename by case alone
+        self.a.git("mv", "skills/foo-tmp", "skills/Foo")
+        for _ in range(3):
+            self.a.run()
+            self.b.run()
+        for m in (self.a, self.b):
+            self.assertNotIn("error", self.problems(m), m.name)
+            self.assertIn("v1", m.read(".claude/skills/Foo/SKILL.md"))
+        self.b.write(".claude/commands/hello.md", "still syncing\n")
+        self.b.run()
+        self.assertEqual(self.remote_show("commands/hello.md"), "still syncing\n")
+
+    def test_case_twins_created_together_adopt_only_one(self):
+        if not self.case_sensitive():
+            self.skipTest("filesystem is case-insensitive")
+        self.a.write(".claude/skills/bar/SKILL.md", "bar\n", old=True)
+        self.a.write(".claude/skills/BAR/SKILL.md", "BAR\n", old=True)
+        self.a.run()
+        files = self.remote_files()
+        self.assertEqual(int("skills/bar/SKILL.md" in files) + int("skills/BAR/SKILL.md" in files), 1)
+        self.assertIn("only in case", self.a.hook())
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ keeps the local version instead). [SETUP.md](SETUP.md) walks an agent through al
 
 | Command | What it does |
 |---|---|
-| `agent-sync` | Sync now (what the timer runs, and what agents run after editing) |
+| `agent-sync` | Sync now (what the timer runs, and what agents run after editing); `--allow-deletes`, `--allow-large`, `--accept-rewrite` release a held sync |
 | `agent-sync status` | Last sync, local/remote state, timer, open problems |
 | `agent-sync doctor` | Check links, settings, the remote, referenced commands, plugins, `requires` |
 | `agent-sync apply [--dry-run]` | Update `~/.claude` from the repo without touching git |
@@ -121,8 +121,10 @@ keeps the local version instead). [SETUP.md](SETUP.md) walks an agent through al
   arrives from elsewhere, machines keep their current settings and only fetch until a fix lands.
 - **Cloned skills**: a folder with its own `.git` (a skill installed with `git clone`) isn't adopted,
   because git would store it as an empty submodule. Delete its `.git` to share it, or list it in `ignore`.
-- **History rewrites**: rebasing uses the fork point, so after you purge something from the remote's
-  history and force-push, other machines don't push the old commits back.
+- **History rewrites**: if the remote's history is rewritten (a force-push), each machine that still has
+  the removed commits pauses with a problem instead of guessing. Run `agent-sync --accept-rewrite` there
+  if the rewrite was deliberate (say, purging a leaked secret: the machines then drop those commits too),
+  or `git rebase origin/main` in the repo if it was a mistake (the machine's commits are replayed on top).
 - **Errors**: any failed sync (a stale `index.lock`, a missing git identity, an unreachable remote on a
   new machine) is recorded and shown by the SessionStart hook, `status` and `doctor`.
 - **Backups**: anything agent-sync replaces on a machine is moved to

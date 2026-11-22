@@ -31,11 +31,10 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
     ),
 ]
 
-# Environment variable names that hold secrets even when the value has no recognizable shape. Anchored
-# at the end so settings like MAX_THINKING_TOKENS or CLAUDE_CODE_MAX_OUTPUT_TOKENS don't count.
-SECRET_NAME = re.compile(
-    r"(?i)(^|_)(token|secret|passw(or)?d|pass|api_?key|access_?key|private_?key|credentials?|auth)$"
-)
+# Environment variable names that hold secrets even when the value has no recognizable shape
+# (SECRET_KEY, DB_PASSWORD_PROD, githubToken). Names that only count or cap tokens are not secrets.
+SECRET_NAME = re.compile(r"(?i)(token|secret|passw(or)?d|api_?key|private_?key|credential)")
+NOT_SECRET_NAME = re.compile(r"(?i)(tokens$|tokens?_(limit|budget|count)|(^|_)max_|_(count|limit|budget)$)")
 
 
 def find(text: str) -> List[str]:
@@ -76,7 +75,10 @@ def is_secret_setting(path: Iterable[str], value: object) -> bool:
     # Same patterns as the commit-time scan, so anything that would hold a commit stays local instead.
     if any(find(s) for s in _strings(value)):
         return True
-    return len(path) >= 2 and path[-2] == "env" and bool(SECRET_NAME.search(str(path[-1])))
+    if len(path) < 2 or path[-2] != "env":
+        return False
+    name = str(path[-1])
+    return bool(SECRET_NAME.search(name)) and not NOT_SECRET_NAME.search(name)
 
 
 def _strings(value: object) -> Iterable[str]:

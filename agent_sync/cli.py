@@ -53,7 +53,8 @@ def _refuse_if_set_up(paths: Paths, force: bool) -> None:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     ctx = Context.load(lenient=True)  # a broken repo file must not stop sync from fetching the fix
-    return syncer.sync(ctx, quiet=args.quiet, allow_deletes=args.allow_deletes, allow_large=args.allow_large)
+    return syncer.sync(ctx, quiet=args.quiet, allow_deletes=args.allow_deletes, allow_large=args.allow_large,
+                       accept_rewrite=args.accept_rewrite)
 
 
 def _preflight(args: argparse.Namespace) -> None:
@@ -205,6 +206,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="print nothing (for the timer); problems go to the log")
     p.add_argument("--allow-deletes", action="store_true", help="sync a large deletion that was held")
     p.add_argument("--allow-large", action="store_true", help="sync large files that were held")
+    p.add_argument("--accept-rewrite", action="store_true",
+                   help="the remote's history was deliberately rewritten: drop the commits it no longer has")
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
     def identity(sp: argparse.ArgumentParser) -> None:

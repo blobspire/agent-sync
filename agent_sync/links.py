@@ -76,6 +76,13 @@ def _fold(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:  # missing, dangling or unreadable: not the same entry
+        return False
+
+
 def _has_git(path: Path) -> bool:
     if not path.is_dir():
         return False
@@ -166,21 +173,19 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
             if name in repo_names:
                 continue
             dst = dest_dir / name
-            twin = repo_folded.get(_fold(name))
-            if twin is not None:
-                twin_dst = dest_dir / twin
-                if twin_dst.exists() and os.path.samefile(twin_dst, dst):
-                    continue  # the filesystem treats both names as one entry: handled above
-                if not dst.is_symlink():
-                    actions.append(Action(kind, name, "collision",
-                                          f"differs only in case or accents from the shared {kind}/{twin}; rename it "
-                                          "to share it (macOS can't hold both)"))
-                continue
             if dst.is_symlink():
                 if _points_into(dst, repo_dir):
                     actions.append(Action(kind, name, "unlink", "removed from the repo"))
                 continue
             if name in ctx.ignored(kind) or not _adoptable(kind, dst):
+                continue
+            twin = repo_folded.get(_fold(name))
+            if twin is not None:
+                if _same_file(dest_dir / twin, dst):
+                    continue  # the filesystem treats both names as one entry: handled above
+                actions.append(Action(kind, name, "collision",
+                                      f"differs only in case or accents from the shared {kind}/{twin}; rename it "
+                                      "to share it (macOS can't hold both)"))
                 continue
             if not adopt_all and _newest_mtime(dst) > time.time() - QUIET_SECONDS:
                 continue  # still being written; adopt on a later run
@@ -189,6 +194,7 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
                                       "has its own .git folder (installed with git clone?)"))
                 continue
             actions.append(Action(kind, name, "adopt"))
+            repo_folded[_fold(name)] = name  # a second new name equal to this one under folding is a twin
     return actions
 
 
