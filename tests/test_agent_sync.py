@@ -920,5 +920,44 @@ class ReviewFixesRound2(Base):
         self.assertIn("only in case", self.a.hook())
 
 
+
+class ReviewFixesRound3(Base):
+    def test_purge_that_rewrites_the_root_commit_is_not_pushed_back(self):
+        self.a.write(".claude/skills/foo/notes.txt", "password hunter2\n")
+        self.a.run()
+        self.b.run()
+        o = self.outsider()
+        o.git("checkout", "-q", "--orphan", "purged")  # whole history replaced: no shared commit remains
+        o.git("rm", "-q", "--cached", "skills/foo/notes.txt")
+        (o.repo / "skills/foo/notes.txt").unlink()
+        o.git("commit", "-q", "-m", "purged history")
+        o.git("push", "-q", "--force", "origin", "purged:main")
+        self.b.run()
+        self.a.run()
+        self.assertNotIn("notes.txt", self.remote_files())
+        for m in (self.a, self.b):
+            self.assertIn("rewrite", m.state()["problems"], m.name)
+        self.b.run("--accept-rewrite")
+        self.assertNotIn("rewrite", self.b.state()["problems"])
+        self.assertNotIn("notes.txt", self.remote_files())
+        self.assertFalse((self.b.repo / "skills/foo/notes.txt").exists())
+
+
+class SecretNameTest(unittest.TestCase):
+    SECRET = ["GITHUB_TOKEN", "SECRET_KEY", "DB_PASSWORD_PROD", "githubToken", "ANTHROPIC_API_KEY",
+              "AWS_SECRET_ACCESS_KEY", "DB_PASS", "SMTP_PASS", "NPM_AUTH", "BASIC_AUTH", "MINIO_ACCESS_KEY",
+              "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_OAUTH_TOKEN"]
+    SHARED = ["MAX_THINKING_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MAX_MCP_OUTPUT_TOKENS",
+              "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "GIT_AUTHOR_NAME", "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+              "TOKENIZERS_PARALLELISM", "USE_CREDENTIAL_HELPER", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+              "CLAUDE_CODE_DISABLE_MOUSE", "AUTHOR"]
+
+    def test_env_names(self):
+        for name in self.SECRET:
+            self.assertTrue(scan.is_secret_setting(["env", name], "x"), name)
+        for name in self.SHARED:
+            self.assertFalse(scan.is_secret_setting(["env", name], "x"), name)
+
+
 if __name__ == "__main__":
     unittest.main()

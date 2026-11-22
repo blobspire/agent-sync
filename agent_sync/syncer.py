@@ -337,10 +337,15 @@ def _rewritten_away(git: Git, branch: str) -> List[str]:
     fork = git.run("merge-base", "--fork-point", f"origin/{branch}", "HEAD", check=False)
     if fork.returncode != 0 or not fork.stdout.strip():
         return []
+    fork_sha = fork.stdout.strip()
     base = git.run("merge-base", f"origin/{branch}", "HEAD", check=False).stdout.strip()
-    if not base or fork.stdout.strip() == base:
+    if not base:
+        # The remote shares no commit with this machine any more (a purge that rewrote the root commit,
+        # filter-repo over everything, a recreated repo): everything up to the fork point was rewritten away.
+        return git.out("rev-list", "--oneline", fork_sha).splitlines()
+    if fork_sha == base:
         return []
-    return git.out("rev-list", "--oneline", f"{base}..{fork.stdout.strip()}").splitlines()
+    return git.out("rev-list", "--oneline", f"{base}..{fork_sha}").splitlines()
 
 
 def _exchange(ctx: Context, st: State, git: Git, lines: List[str], accept_rewrite: bool,

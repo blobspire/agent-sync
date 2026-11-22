@@ -33,8 +33,15 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
 
 # Environment variable names that hold secrets even when the value has no recognizable shape
 # (SECRET_KEY, DB_PASSWORD_PROD, githubToken). Names that only count or cap tokens are not secrets.
-SECRET_NAME = re.compile(r"(?i)(token|secret|passw(or)?d|api_?key|private_?key|credential)")
-NOT_SECRET_NAME = re.compile(r"(?i)(tokens$|tokens?_(limit|budget|count)|(^|_)max_|_(count|limit|budget)$)")
+SECRET_NAME = re.compile(
+    r"(?i)(token|secret|passw(or)?d|passphrase|api_?key|private_?key|credential"
+    r"|(^|_)(pass|auth|access_?key)($|_))"
+)
+# ...except names that only count, cap or switch something (MAX_THINKING_TOKENS, CLAUDE_CODE_SKIP_BEDROCK_AUTH).
+NOT_SECRET_NAME = re.compile(
+    r"(?i)(tokens$|tokens?_(limit|budget|count)|(^|_)(max|skip|use|disable|enable)_"
+    r"|_(count|limit|budget|ttl|ttl_ms|parallelism|helper)$)"
+)
 
 
 def find(text: str) -> List[str]:
