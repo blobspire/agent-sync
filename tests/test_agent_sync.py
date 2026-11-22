@@ -623,6 +623,22 @@ class ReviewFixes(Base):
         self.assertNotIn("FOO", self.remote_files())
         self.assertEqual(c.read(".claude/skills/FOO/SKILL.md"), "c's own FOO\n")
 
+    def test_case_variant_on_a_case_sensitive_filesystem_is_reported_not_adopted(self):
+        probe = self.tmp / "CaseProbe2"
+        probe.write_text("")
+        if (self.tmp / "caseprobe2").exists():
+            self.skipTest("filesystem is case-insensitive")
+        self.a.write(".claude/skills/FOO/SKILL.md", "a distinct FOO\n", old=True)
+        self.a.run()
+        self.assertNotIn("skills/FOO", self.remote_files())
+        self.assertIn("only in case", self.a.hook())
+
+    def test_skill_json_fixtures_are_content_not_held(self):
+        self.a.write(".claude/skills/foo/fixture.json", '{"jsonc": true, // a comment\n}\n')
+        self.a.run()
+        self.assertNotIn("held", self.problems(self.a))
+        self.assertIn("skills/foo/fixture.json", self.remote_files())
+
     def test_linked_kind_folder_is_left_alone(self):
         dotfiles = self.tmp / "dotfiles/skills"
         (dotfiles / "x").mkdir(parents=True)

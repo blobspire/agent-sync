@@ -137,7 +137,7 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
             actions.append(Action(kind, "", "foreign", f"~/.claude/{kind} is itself a link to {os.readlink(dest_dir)}"))
             continue
         repo_names = _entries(repo_dir)
-        repo_folded = {_fold(n) for n in repo_names}
+        repo_folded = {_fold(n): n for n in repo_names}
         for name in repo_names:
             src, dst = repo_dir / name, dest_dir / name
             if not ctx.allowed(kind, name):
@@ -163,9 +163,19 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
             else:
                 actions.append(Action(kind, name, "link"))
         for name in _entries(dest_dir):
-            if name in repo_names or _fold(name) in repo_folded:
-                continue  # same name, or one the filesystem treats as the same: handled (or reported) above
+            if name in repo_names:
+                continue
             dst = dest_dir / name
+            twin = repo_folded.get(_fold(name))
+            if twin is not None:
+                twin_dst = dest_dir / twin
+                if twin_dst.exists() and os.path.samefile(twin_dst, dst):
+                    continue  # the filesystem treats both names as one entry: handled above
+                if not dst.is_symlink():
+                    actions.append(Action(kind, name, "collision",
+                                          f"differs only in case or accents from the shared {kind}/{twin}; rename it "
+                                          "to share it (macOS can't hold both)"))
+                continue
             if dst.is_symlink():
                 if _points_into(dst, repo_dir):
                     actions.append(Action(kind, name, "unlink", "removed from the repo"))
@@ -219,6 +229,8 @@ def apply(ctx: Context, actions: List[Action], backups: Backups) -> List[str]:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dst), str(src))
                 os.symlink(src, dst)
+            elif a.op == "collision" and a.detail.startswith("differs only"):
+                problems.append(f"{ctx.paths.tilde(dst)} {a.detail}.")
             elif a.op == "collision":
                 problems.append(
                     f"{ctx.paths.tilde(dst)} is a real copy that differs from the shared one in the repo "

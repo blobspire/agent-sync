@@ -137,10 +137,12 @@ def outgoing_issues(git: Git, pairs: List[Tuple[str, str]], allow_deletes: bool,
     if findings:
         issues.append("possible secrets: " + "; ".join(findings[:8]) + (" ..." if len(findings) > 8 else ""))
 
-    # JSON that doesn't parse would strip settings (or wedge the repo) on every machine that pulls it
+    # agent-sync's own JSON that doesn't parse would strip settings (or wedge the repo) on every machine
+    # that pulls it. Other JSON (a skill's fixtures, JSONC with comments) is just content.
     bad_json = []
     for status, path in pairs:
-        if status != "D" and path.endswith(".json"):
+        own = path == "agent-sync.json" or (path.endswith(".json") and path.split("/")[0] in ("settings", "hosts"))
+        if status != "D" and own:
             try:
                 json.loads((git.repo / path).read_text(encoding="utf-8") or "{}")
             except (ValueError, OSError) as exc:
