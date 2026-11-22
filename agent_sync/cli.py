@@ -52,13 +52,25 @@ def _refuse_if_set_up(paths: Paths, force: bool) -> None:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    ctx = Context.load()
+    ctx = Context.load(lenient=True)  # a broken repo file must not stop sync from fetching the fix
     return syncer.sync(ctx, quiet=args.quiet, allow_deletes=args.allow_deletes, allow_large=args.allow_large)
+
+
+def _preflight(args: argparse.Namespace) -> None:
+    """Checks that need nothing on disk, done before new/init create or clone anything."""
+    validate_host(args.host)
+    name, email = _git_identity(args)
+    if not name or not email:
+        raise AgentSyncError(
+            "agent-sync needs a name and email for the commits it makes. Pass --git-name and --git-email, "
+            "or set user.name and user.email in your global git config."
+        )
 
 
 def cmd_new(args: argparse.Namespace) -> int:
     paths = Paths.from_env()
     _refuse_if_set_up(paths, args.force)
+    _preflight(args)
     repo = Path(args.dir).expanduser().absolute() if args.dir else paths.default_repo
     if repo.exists() and any(repo.iterdir()):
         raise AgentSyncError(f"{repo} already exists and isn't empty.")
@@ -83,6 +95,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     paths = Paths.from_env()
     if not args.dry_run:
         _refuse_if_set_up(paths, args.force)
+    _preflight(args)
     repo = Path(args.dir).expanduser().absolute() if args.dir else paths.default_repo
     if not repo.exists():
         repo.parent.mkdir(parents=True, exist_ok=True)

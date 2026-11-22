@@ -116,8 +116,9 @@ def doctor(ctx: Context) -> Tuple[bool, str]:
 
     git = Git(ctx.repo, ctx.git_name, ctx.git_email)
     add("ok", "config", f"host {ctx.host}, repo {ctx.paths.tilde(ctx.repo)}")
-    if not ctx.git_email:
-        add("warn", "git identity", "no commit name/email in config; commits use git's defaults")
+    if not ctx.git_email or not ctx.git_name:
+        add("fail", "git identity", "no commit name/email in config; set them with `agent-sync init ... --force "
+            "--git-name ... --git-email ...`")
     if git.has_remote():
         r = git.run("ls-remote", "-q", "origin", "HEAD", check=False, timeout=30)
         if r.returncode == 0:

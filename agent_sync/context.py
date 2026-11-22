@@ -83,11 +83,17 @@ class Context:
     command: str
     manifest: dict = field(default_factory=dict)
     hostfile: dict = field(default_factory=dict)
+    load_error: Optional[str] = None  # set by load(lenient=True) when the repo's own config doesn't load
 
     # ---- loading --------------------------------------------------------------------------------
 
     @classmethod
-    def load(cls, paths: Optional[Paths] = None) -> "Context":
+    def load(cls, paths: Optional[Paths] = None, lenient: bool = False) -> "Context":
+        """Read the tool config and the repo's config files.
+
+        lenient: a broken file inside the repo (bad JSON, newer format) is recorded in load_error instead of
+        raised, so sync can still fetch a fix that another machine pushed.
+        """
         paths = paths or Paths.from_env()
         try:
             cfg = jsonutil.load(paths.config_file, None)
@@ -106,18 +112,28 @@ class Context:
             git_email=cfg.get("git", {}).get("email", ""),
             command=cfg.get("command") or default_command(),
         )
-        ctx.reload()
+        try:
+            ctx.reload()
+        except AgentSyncError as exc:
+            if not lenient or not (ctx.repo / ".git").exists():
+                raise
+            ctx.load_error = str(exc)
         return ctx
 
     def reload(self) -> None:
         """Re-read the repo's manifest and host file (they change when a pull lands)."""
         if not (self.repo / ".git").exists():
             raise AgentSyncError(f"The config repo {self.repo} is missing or isn't a git checkout.")
-        try:
-            self.manifest = jsonutil.load(self.repo / "agent-sync.json", {}) or {}
-            self.hostfile = jsonutil.load(self.hostfile_path, {}) or {}
-        except ValueError as exc:
-            raise AgentSyncError(f"A config file in {self.repo} is not valid JSON: {exc}")
+        loaded = []
+        for path in (self.repo / "agent-sync.json", self.hostfile_path):
+            try:
+                data = jsonutil.load(path, {}) or {}
+            except ValueError as exc:
+                raise AgentSyncError(f"{self.paths.tilde(path)} isn't valid JSON ({exc}).")
+            if not isinstance(data, dict):
+                raise AgentSyncError(f"{self.paths.tilde(path)} must contain a JSON object.")
+            loaded.append(data)
+        self.manifest, self.hostfile = loaded
         fmt = self.manifest.get("format", 1)
         if not isinstance(fmt, int) or fmt > FORMAT:
             raise AgentSyncError(

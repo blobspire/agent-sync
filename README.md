@@ -114,8 +114,17 @@ keeps the local version instead). [SETUP.md](SETUP.md) walks an agent through al
 - **Secrets**: every commit's added lines are scanned for common token shapes and `*_KEY=`-style
   assignments. A hit holds the commit and is reported (file and line, never the value). Add
   `agent-sync: allow` to a line that is a false positive.
-- **Accidents**: deleting more than 20 files, or more than half the repo, in one sync is held until you
-  run `agent-sync --allow-deletes`. Files over `max_file_mb` (5 MB) are held the same way.
+- **Accidents**: a sync that deletes more than 20 files, more than half the repo, or more than half of the
+  skills, commands, agents or notes (at least 2) is held until you run `agent-sync --allow-deletes`. Files
+  over `max_file_mb` (5 MB) are held the same way, and so is any JSON file in the repo that doesn't parse
+  (a broken `settings/base.json` would otherwise strip shared settings everywhere). If a broken file
+  arrives from elsewhere, machines keep their current settings and only fetch until a fix lands.
+- **Cloned skills**: a folder with its own `.git` (a skill installed with `git clone`) isn't adopted,
+  because git would store it as an empty submodule. Delete its `.git` to share it, or list it in `ignore`.
+- **History rewrites**: rebasing uses the fork point, so after you purge something from the remote's
+  history and force-push, other machines don't push the old commits back.
+- **Errors**: any failed sync (a stale `index.lock`, a missing git identity, an unreachable remote on a
+  new machine) is recorded and shown by the SessionStart hook, `status` and `doctor`.
 - **Backups**: anything agent-sync replaces on a machine is moved to
   `~/.local/state/agent-sync/backups/<time>/` first. Everything in the repo has git history.
 - Never touched: `~/.claude.json` (logins), sessions and transcripts, the plugin cache, claude.ai's
@@ -128,6 +137,9 @@ See [SECURITY.md](SECURITY.md) for the threat model.
 - Claude Code only, for now.
 - Auto memory stays per machine (Claude Code has no setting to move it). Notes are the shared alternative.
 - A settings value of JSON `null` can't be expressed in an overlay (`null` means delete).
+- Lists are replaced whole, not merged: if a machine edits a list that comes from `base.json` (say
+  `permissions.allow`), its overlay holds the whole list, and later changes to that list in the base no
+  longer reach it. Change shared lists in `base.json`, not through one machine.
 - Running sessions pick up skill and most settings changes immediately. `CLAUDE.md` changes apply to
   new sessions.
 

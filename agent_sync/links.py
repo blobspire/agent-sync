@@ -14,6 +14,7 @@ import filecmp
 import os
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -28,7 +29,7 @@ QUIET_SECONDS = 120  # don't adopt something an agent is still writing
 class Action:
     kind: str
     name: str
-    op: str  # link, relink, unlink, adopt, replace, take-local, collision, foreign
+    op: str  # link, relink, unlink, adopt, replace, take-local, collision, foreign, nested-git
     detail: str = ""
 
     @property
@@ -37,7 +38,7 @@ class Action:
 
     @property
     def is_problem(self) -> bool:
-        return self.op in ("collision", "foreign")
+        return self.op in ("collision", "foreign", "nested-git")
 
     def describe(self) -> str:
         words = {
@@ -49,6 +50,7 @@ class Action:
             "take-local": "copy local version into repo, then link",
             "collision": "CONFLICT",
             "foreign": "SKIPPED",
+            "nested-git": "NOT SHARED",
         }[self.op]
         return f"{words:<14} {self.rel}" + (f"  ({self.detail})" if self.detail else "")
 
@@ -67,6 +69,20 @@ def _real(path: Path) -> str:
 def _points_into(link: Path, root: Path) -> bool:
     target, root_real = _real(link), _real(root)
     return target == root_real or target.startswith(root_real + os.sep)
+
+
+def _fold(name: str) -> str:
+    """Names macOS treats as the same file (APFS ignores case and Unicode normalization by default)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _has_git(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    for root, dirs, files in os.walk(path):
+        if ".git" in dirs or ".git" in files:
+            return True
+    return False
 
 
 def _adoptable(kind: str, path: Path) -> bool:
@@ -115,7 +131,13 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
     actions: List[Action] = []
     for kind in KINDS:
         repo_dir, dest_dir = ctx.repo / kind, ctx.paths.claude / kind
+        if dest_dir.is_symlink():
+            # Linking inside a linked folder would rewrite whatever it points at (another tool's tree,
+            # or the repo itself). Leave the whole kind alone.
+            actions.append(Action(kind, "", "foreign", f"~/.claude/{kind} is itself a link to {os.readlink(dest_dir)}"))
+            continue
         repo_names = _entries(repo_dir)
+        repo_folded = {_fold(n) for n in repo_names}
         for name in repo_names:
             src, dst = repo_dir / name, dest_dir / name
             if not ctx.allowed(kind, name):
@@ -141,8 +163,8 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
             else:
                 actions.append(Action(kind, name, "link"))
         for name in _entries(dest_dir):
-            if name in repo_names:
-                continue
+            if name in repo_names or _fold(name) in repo_folded:
+                continue  # same name, or one the filesystem treats as the same: handled (or reported) above
             dst = dest_dir / name
             if dst.is_symlink():
                 if _points_into(dst, repo_dir):
@@ -152,6 +174,10 @@ def plan(ctx: Context, adopt_all: bool = False, prefer: str = "repo") -> List[Ac
                 continue
             if not adopt_all and _newest_mtime(dst) > time.time() - QUIET_SECONDS:
                 continue  # still being written; adopt on a later run
+            if _has_git(dst):
+                actions.append(Action(kind, name, "nested-git",
+                                      "has its own .git folder (installed with git clone?)"))
+                continue
             actions.append(Action(kind, name, "adopt"))
     return actions
 
@@ -186,6 +212,10 @@ def apply(ctx: Context, actions: List[Action], backups: Backups) -> List[str]:
                 backups.move(dst)
                 os.symlink(src, dst)
             elif a.op == "adopt":
+                if src.exists() or src.is_symlink():
+                    problems.append(f"Didn't adopt {ctx.paths.tilde(dst)}: the repo already has {a.rel} "
+                                    "(maybe under a name differing only in case).")
+                    continue
                 src.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dst), str(src))
                 os.symlink(src, dst)
@@ -196,7 +226,17 @@ def apply(ctx: Context, actions: List[Action], backups: Backups) -> List[str]:
                     f"then delete the local copy; the next sync links it."
                 )
             elif a.op == "foreign":
-                problems.append(f"{ctx.paths.tilde(dst)} {a.detail}, so the shared {a.rel} isn't installed here.")
+                if a.name:
+                    problems.append(f"{ctx.paths.tilde(dst)} {a.detail}, so the shared {a.rel} isn't installed here.")
+                else:
+                    problems.append(f"{a.detail}, so agent-sync doesn't manage {a.kind} on this machine. "
+                                    f"Make ~/.claude/{a.kind} a real folder to share them.")
+            elif a.op == "nested-git":
+                problems.append(
+                    f"{ctx.paths.tilde(dst)} {a.detail}, so it isn't shared: git would store it as an empty "
+                    "submodule. Delete its .git folder to share it as plain files, or add its name to "
+                    "\"ignore\" in agent-sync.json to keep it on this machine only."
+                )
         except OSError as exc:
             problems.append(f"Couldn't {a.op} {a.rel}: {exc}")
     return problems

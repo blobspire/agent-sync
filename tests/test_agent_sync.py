@@ -200,7 +200,7 @@ class TimerTest(unittest.TestCase):
 # ---- end to end ---------------------------------------------------------------------------------
 
 
-class TwoMachines(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="agent-sync-test-"))
         self.remote = self.tmp / "remote.git"
@@ -224,6 +224,19 @@ class TwoMachines(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.remote), "ls-tree", "-r", "--name-only", "main"],
                               capture_output=True, text=True).stdout
 
+    def outsider(self) -> Machine:
+        """A plain clone of the remote, standing in for an edit made outside agent-sync (e.g. on GitHub)."""
+        o = Machine(self.tmp, "outsider")
+        subprocess.run(["git", "clone", "-q", self.url, str(o.repo)], check=True, env=o.env)
+        return o
+
+    def push_as_outsider(self, o: Machine, message: str, force: bool = False) -> None:
+        o.git("add", "-A")
+        o.git("commit", "-q", "-m", message)
+        o.git("push", "-q", *(["--force"] if force else []), "origin", "HEAD:main")
+
+
+class TwoMachines(Base):
     # setup ------------------------------------------------------------------------------------
 
     def test_setup_links_and_preserves_each_machines_settings(self):
@@ -273,7 +286,9 @@ class TwoMachines(unittest.TestCase):
 
     def test_claude_ai_synced_and_foreign_links_are_left_alone(self):
         b = self.b
+        b.write(".claude/skills/synced/SKILL.md", "claude.ai's\n", old=True)
         b.write(".claude/skills/synced/x/SKILL.md", "claude.ai's\n", old=True)
+        age(b.claude / "skills/synced")
         elsewhere = self.tmp / "elsewhere" / "other"
         elsewhere.mkdir(parents=True)
         (elsewhere / "SKILL.md").write_text("another tool's skill\n")
@@ -428,9 +443,9 @@ class TwoMachines(unittest.TestCase):
         manifest = json.loads((self.a.repo / "agent-sync.json").read_text())
         manifest["format"] = 99
         (self.a.repo / "agent-sync.json").write_text(json.dumps(manifest))
-        r = self.a.run(ok=False)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("format 99", r.stderr)
+        self.a.run()  # fetch-only recovery, so a fix pushed elsewhere can still arrive
+        self.assertIn("repo", self.a.state()["problems"])
+        self.assertIn("format 99", self.a.hook())
 
     def test_dry_run_changes_nothing(self):
         c = Machine(self.tmp, "c")
@@ -462,6 +477,271 @@ class TwoMachines(unittest.TestCase):
         self.assertIn("A-only rule", doc)
         self.assertNotIn("hook session-start", json.dumps(a.settings()))
         self.assertFalse((a.home / ".config/agent-sync/config.json").exists())
+
+
+
+class ReviewFixes(Base):
+    """Regression pins for the defects the first fresh-eyes review found."""
+
+    def problems(self, m: Machine) -> dict:
+        return m.state()["problems"]
+
+    # sync never fails silently -------------------------------------------------------------------
+
+    def test_unexpected_git_error_becomes_a_visible_problem(self):
+        lock_file = self.a.repo / ".git/index.lock"
+        lock_file.write_text("")
+        self.a.write(".claude/skills/foo/SKILL.md", "v2\n")
+        r = self.a.run("--quiet", ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error", self.problems(self.a))
+        self.assertIn("index.lock", self.a.hook())
+        # a lock left by a killed git (old) is cleared, and syncing resumes
+        os.utime(lock_file, (OLD, OLD))
+        self.a.run()
+        self.assertNotIn("error", self.problems(self.a))
+        self.assertIn("v2", subprocess.run(["git", "-C", str(self.remote), "show", "main:skills/foo/SKILL.md"],
+                                           capture_output=True, text=True).stdout)
+
+    def test_setup_refuses_without_a_git_identity_and_creates_nothing(self):
+        c = Machine(self.tmp, "c")
+        r = c.run("new", "--host", "c", ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--git-email", r.stderr)
+        self.assertFalse(c.repo.exists())
+        self.assertFalse((c.home / ".config/agent-sync/config.json").exists())
+
+    def test_never_reached_remote_is_reported(self):
+        c = Machine(self.tmp, "c")
+        c.run("new", "--host", "c", "--remote", str(self.tmp / "typo.git"), *ID)
+        self.assertIn("remote", self.problems(c))
+        self.assertIn("never reached", c.hook())
+
+    # broken JSON ---------------------------------------------------------------------------------
+
+    def test_broken_base_json_is_held_and_settings_are_kept(self):
+        before = self.a.settings()
+        (self.a.repo / "settings/base.json").write_text('{"model": "x",}')
+        self.a.run()
+        self.assertEqual(self.a.settings(), before)
+        self.assertIn("held", self.problems(self.a))
+        self.assertIn("invalid JSON", self.a.hook())
+        self.assertIn("{}", subprocess.run(["git", "-C", str(self.remote), "show", "main:settings/base.json"],
+                                           capture_output=True, text=True).stdout)
+
+    def test_broken_base_json_from_elsewhere_leaves_settings_alone(self):
+        (self.a.repo / "settings/base.json").write_text(json.dumps({"permissions": {"deny": ["Bash(rm -rf /)"]}}))
+        self.a.run()
+        self.b.run()
+        self.assertIn("deny", json.dumps(self.b.settings()))
+        o = self.outsider()
+        (o.repo / "settings/base.json").write_text('{"permissions": {"deny": ["Bash(rm -rf /)"],}}')
+        self.push_as_outsider(o, "broken edit")
+        self.b.run()
+        self.assertIn("deny", json.dumps(self.b.settings()))  # not regenerated without the base
+        self.assertIn("settings", self.problems(self.b))
+
+    def test_broken_manifest_from_elsewhere_heals_when_fixed_upstream(self):
+        o = self.outsider()
+        good = (o.repo / "agent-sync.json").read_text()
+        (o.repo / "agent-sync.json").write_text('{"format": 1,}')
+        self.push_as_outsider(o, "broken manifest")
+        self.b.run()
+        self.assertIn("repo", self.problems(self.b))
+        (o.repo / "agent-sync.json").write_text(good)
+        o.write(".local/share/agent-config/skills/foo/SKILL.md", "fixed upstream\n")
+        self.push_as_outsider(o, "fix manifest")
+        self.b.run()
+        self.assertNotIn("repo", self.problems(self.b))
+        self.assertEqual(self.b.read(".claude/skills/foo/SKILL.md"), "fixed upstream\n")
+
+    # deletions and history -----------------------------------------------------------------------
+
+    def test_wiping_every_skill_is_held_even_in_a_small_repo(self):
+        for name in ("bar", "baz"):
+            self.a.write(f".claude/skills/{name}/SKILL.md", f"{name}\n", old=True)
+        self.a.run()
+        for name in ("foo", "bar", "baz"):
+            for f in (self.a.claude / "skills" / name).iterdir():
+                f.unlink()  # what `rm -rf ~/.claude/skills/*/` does through the links
+        self.a.run()
+        self.assertIn("held", self.problems(self.a))
+        self.assertIn("skills/bar/SKILL.md", self.remote_files())
+
+    def test_more_than_twenty_deleted_files_is_held_even_when_under_half(self):
+        for i in range(60):
+            self.a.write(f".local/share/agent-config/notes/n{i}.md", f"{i}\n")
+        self.a.run()
+        for i in range(25):
+            (self.a.repo / f"notes/n{i}.md").unlink()
+        self.a.run()
+        self.assertIn("held", self.problems(self.a))
+        self.assertIn("25 files", self.a.hook())
+
+    def test_history_rewrite_is_not_undone_by_other_machines(self):
+        self.a.write(".claude/skills/foo/creds.txt", "password hunter2\n")
+        self.a.run()
+        self.b.run()
+        o = self.outsider()
+        o.git("reset", "-q", "--hard", "HEAD~1")
+        o.git("push", "-q", "--force", "origin", "HEAD:main")
+        self.b.run()
+        self.a.run()
+        self.assertNotIn("creds.txt", self.remote_files())
+
+    # filesystem ----------------------------------------------------------------------------------
+
+    def test_cloned_skill_is_not_adopted_as_an_empty_submodule(self):
+        d = self.a.claude / "skills/cloned"
+        d.mkdir()
+        subprocess.run(["git", "init", "-q", str(d)], check=True)
+        (d / "SKILL.md").write_text("cloned\n")
+        age(d)
+        self.a.run()
+        self.assertFalse(d.is_symlink())
+        self.assertNotIn("skills/cloned", self.remote_files())
+        self.assertIn(".git", self.a.hook())
+
+    def test_differing_local_copy_is_kept_on_plain_init(self):
+        c = Machine(self.tmp, "c")
+        c.write(".claude/skills/foo/SKILL.md", "c's own foo\n", old=True)
+        c.run("init", self.url, "--host", "c", *ID)
+        self.assertFalse((c.claude / "skills/foo").is_symlink())
+        self.assertEqual(c.read(".claude/skills/foo/SKILL.md"), "c's own foo\n")
+        self.assertIn("links", self.problems(c))
+        self.assertNotIn("c's own", subprocess.run(["git", "-C", str(self.remote), "show", "main:skills/foo/SKILL.md"],
+                                                   capture_output=True, text=True).stdout)
+
+    def test_case_variant_name_is_not_nested_into_the_shared_skill(self):
+        probe = self.tmp / "CaseProbe"
+        probe.write_text("")
+        if not (self.tmp / "caseprobe").exists():
+            self.skipTest("filesystem is case-sensitive")
+        c = Machine(self.tmp, "c")
+        c.write(".claude/skills/FOO/SKILL.md", "c's own FOO\n", old=True)
+        c.run("init", self.url, "--host", "c", *ID)
+        self.assertNotIn("FOO", self.remote_files())
+        self.assertEqual(c.read(".claude/skills/FOO/SKILL.md"), "c's own FOO\n")
+
+    def test_linked_kind_folder_is_left_alone(self):
+        dotfiles = self.tmp / "dotfiles/skills"
+        (dotfiles / "x").mkdir(parents=True)
+        (dotfiles / "x/SKILL.md").write_text("dotfiles x\n")
+        age(dotfiles / "x")
+        c = Machine(self.tmp, "c")
+        os.symlink(dotfiles, c.claude / "skills")
+        c.run("init", self.url, "--host", "c", "--adopt", *ID)
+        self.assertEqual(sorted(os.listdir(dotfiles)), ["x"])
+        self.assertFalse((dotfiles / "x").is_symlink())
+        self.assertIn("itself a link", c.hook())
+
+    # CLAUDE.md -----------------------------------------------------------------------------------
+
+    def test_damaged_markers_never_swallow_other_blocks(self):
+        path = self.a.claude / "CLAUDE.md"
+        docket = "<!-- BEGIN docket (managed by `docket init --agent`; remove with `docket uninstall`) -->\nkeep me\n<!-- END docket -->\n"
+        path.write_text(path.read_text().replace(claudemd.END + "\n", "") + "\n" + docket)
+        self.a.run()
+        self.a.run()
+        self.assertIn("keep me", path.read_text())
+        self.assertIn("claude-md-broken", self.problems(self.a))
+        self.assertIn("markers are damaged", self.a.hook())
+
+    def test_relative_imports_keep_working_after_adoption(self):
+        c = Machine(self.tmp, "c")
+        c.write(".claude/RTK.md", "rtk rules\n")
+        c.write(".claude/CLAUDE.md", "my rule\n@RTK.md\nmail me@example.com\n")
+        c.run("init", self.url, "--host", "c", "--adopt", *ID)
+        host_md = (c.repo / "hosts/c.md").read_text()
+        self.assertIn("@~/.claude/RTK.md", host_md)
+        self.assertIn("me@example.com", host_md)
+
+
+    # settings ------------------------------------------------------------------------------------
+
+    def test_deleting_or_replacing_a_local_secret_sticks(self):
+        s = self.a.settings()
+        s["env"]["FOO"] = "ghp_" + "a1B2" * 9
+        s["other"] = "sk-ant-" + "x" * 30
+        self.a.set_settings(s)
+        self.a.run()
+        self.assertNotIn("ghp_", json.dumps(self.a.hostfile()))
+        s = self.a.settings()
+        s["env"]["FOO"] = "plain-value"
+        del s["other"]
+        self.a.set_settings(s)
+        self.a.run()
+        self.a.run()
+        s = self.a.settings()
+        self.assertEqual(s["env"]["FOO"], "plain-value")
+        self.assertNotIn("other", s)
+        self.assertEqual(self.a.hostfile()["settings"]["env"]["FOO"], "plain-value")
+
+    def test_token_count_settings_are_shared_not_secret(self):
+        s = self.a.settings()
+        s["env"]["MAX_THINKING_TOKENS"] = "31999"
+        self.a.set_settings(s)
+        self.a.run()
+        self.assertEqual(self.a.hostfile()["settings"]["env"]["MAX_THINKING_TOKENS"], "31999")
+        self.assertFalse((self.a.state_dir / "local-settings.json").exists())
+
+    def test_user_hook_added_next_to_agent_syncs_is_kept(self):
+        s = self.a.settings()
+        entry = next(e for e in s["hooks"]["SessionStart"] if "hook session-start" in json.dumps(e))
+        entry["hooks"].append({"type": "command", "command": "echo mine"})
+        self.a.set_settings(s)
+        self.a.run()
+        self.a.run()
+        self.assertIn("echo mine", json.dumps(self.a.settings()))
+        self.assertIn("echo mine", json.dumps(self.a.hostfile()))
+        self.assertEqual(json.dumps(self.a.settings()).count("hook session-start"), 1)
+
+    def test_secret_in_a_hook_command_stays_local_and_sync_continues(self):
+        s = self.a.settings()
+        token = "ghp_" + "a1B2" * 9
+        s["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": f"curl -H 'Authorization: Bearer {token}' x"}]}]
+        self.a.set_settings(s)
+        self.a.run()
+        self.assertNotIn("held", self.problems(self.a))
+        self.assertNotIn(token, json.dumps(self.a.hostfile()))
+        self.assertIn(token, json.dumps(self.a.settings()))
+        self.a.write(".claude/skills/later/SKILL.md", "later\n", old=True)
+        self.a.run()
+        self.assertIn("skills/later/SKILL.md", self.remote_files())
+
+    def test_capture_keeps_this_hosts_existing_overlay(self):
+        s = self.a.settings()
+        s["env"]["Y"] = "2"
+        self.a.set_settings(s)
+        self.a.run()
+        overlay = self.a.hostfile()["settings"]
+        self.assertEqual(overlay["model"], "a-model")
+        self.assertEqual(overlay["env"], {"X": "1", "Y": "2"})
+        self.assertEqual(overlay["statusLine"]["command"], "{{HOME}}/bin/status")
+
+    def _pull_base_change_without_applying(self, m: Machine) -> None:
+        o = self.outsider()
+        (o.repo / "settings/base.json").write_text(json.dumps({"effortLevel": "high"}))
+        self.push_as_outsider(o, "base: effort high")
+        m.git("pull", "-q", "--rebase")  # as if the sync crashed between pull and apply
+
+    def test_base_change_pulled_but_not_applied_is_not_pinned_by_a_local_edit(self):
+        self._pull_base_change_without_applying(self.b)
+        s = self.b.settings()
+        s["model"] = "b2"
+        self.b.set_settings(s)
+        self.b.run()
+        self.assertEqual(self.b.settings()["effortLevel"], "high")
+        self.assertEqual(self.b.settings()["model"], "b2")
+        self.assertNotIn("effortLevel", self.b.hostfile().get("settings", {}))
+
+    def test_settings_written_but_not_recorded_is_not_pinned(self):
+        self._pull_base_change_without_applying(self.b)
+        generated = self.b.run("settings", "show").stdout
+        (self.b.claude / "settings.json").write_text(generated)  # crash before settings.last.json was saved
+        self.b.run()
+        self.assertNotIn("effortLevel", self.b.hostfile().get("settings", {}))
+        self.assertEqual(self.b.settings()["effortLevel"], "high")
 
 
 if __name__ == "__main__":

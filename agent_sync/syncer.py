@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-from typing import List, Optional, Tuple
+import traceback
+from typing import Dict, List, Set, Tuple
 
 from . import claudemd, jsonutil, links, scan, settings
-from .context import AgentSyncError, Context
+from .context import KINDS, AgentSyncError, Context
 from .gitops import Git, GitError
 from .state import Backups, State, lock, log, now
 
 DELETE_LIMIT = 20  # more deleted files than this in one sync is held for a human
 LARGE_MB = 5
+STALE_INDEX_LOCK = 600  # a git index.lock older than this is left over from a killed git
+CONTENT_KINDS = KINDS + ("notes",)
 
 
 # ---- apply --------------------------------------------------------------------------------------
@@ -50,7 +54,8 @@ def apply(
     except settings.Unreadable as exc:
         st.open_problem(
             "settings",
-            f"{ctx.paths.tilde(settings.settings_path(ctx))} isn't valid JSON ({exc}), so agent-sync left it alone.",
+            f"{ctx.paths.tilde(exc.path)} isn't valid JSON ({exc.detail}), so agent-sync left "
+            f"{ctx.paths.tilde(settings.settings_path(ctx))} as it was.",
             "Fix the JSON; the next sync picks it up.",
         )
 
@@ -65,8 +70,18 @@ def apply(
         st.close_problem("links")
 
     # CLAUDE.md
-    lines += [("would: " if dry_run else "") + n for n in claudemd.apply(ctx, backups, adopt=adopt, dry_run=dry_run)]
     doc_path = claudemd.path(ctx)
+    try:
+        notes = claudemd.apply(ctx, backups, adopt=adopt, dry_run=dry_run)
+        lines += [("would: " if dry_run else "") + n for n in notes]
+        st.close_problem("claude-md-broken")
+    except claudemd.Broken as exc:
+        st.open_problem(
+            "claude-md-broken",
+            f"{ctx.paths.tilde(doc_path)}: {exc}, so agent-sync left the file alone.",
+            "Delete the damaged agent-sync marker lines (keep other tools' blocks intact); the next sync "
+            "adds a clean block.",
+        )
     extra = claudemd.outside_text(doc_path.read_text(encoding="utf-8")) if doc_path.exists() else ""
     if extra and not (adopt and dry_run):
         st.open_problem(
@@ -88,7 +103,7 @@ def _short(paths: List[str], n: int = 6) -> str:
     return ", ".join(paths[:n]) + (f" +{len(paths) - n} more" if len(paths) > n else "")
 
 
-# ---- sync ---------------------------------------------------------------------------------------
+# ---- what may leave this machine ----------------------------------------------------------------
 
 
 GROUPED = ("skills", "commands", "agents", "notes", "hosts", "settings", "hooks", "bin")
@@ -106,43 +121,115 @@ def commit_message(host: str, pairs: List[Tuple[str, str]], first: bool) -> str:
     return f"{host}: {summary}"
 
 
+def _entries_by_kind(paths: List[str]) -> Dict[str, Set[str]]:
+    out: Dict[str, Set[str]] = {k: set() for k in CONTENT_KINDS}
+    for p in paths:
+        parts = p.split("/")
+        if len(parts) >= 2 and parts[0] in out and not parts[1].startswith("."):
+            out[parts[0]].add(parts[1])
+    return out
+
+
 def outgoing_issues(git: Git, pairs: List[Tuple[str, str]], allow_deletes: bool, allow_large: bool, max_mb: float) -> List[str]:
+    """Reasons to hold the staged changes instead of committing them."""
     issues = []
     findings = scan.scan_added_lines(git.staged_patch())
     if findings:
         issues.append("possible secrets: " + "; ".join(findings[:8]) + (" ..." if len(findings) > 8 else ""))
-    deleted = [p for s, p in pairs if s == "D"]
-    total = git.tracked_count() + len(deleted)
-    if not allow_deletes and len(deleted) >= 3 and (len(deleted) > DELETE_LIMIT or len(deleted) * 2 > total):
-        issues.append(f"{len(deleted)} of {total} files deleted at once (e.g. {', '.join(deleted[:3])})")
+
+    # JSON that doesn't parse would strip settings (or wedge the repo) on every machine that pulls it
+    bad_json = []
+    for status, path in pairs:
+        if status != "D" and path.endswith(".json"):
+            try:
+                json.loads((git.repo / path).read_text(encoding="utf-8") or "{}")
+            except (ValueError, OSError) as exc:
+                bad_json.append(f"{path} ({exc})")
+    if bad_json:
+        issues.append("invalid JSON: " + "; ".join(bad_json))
+
+    nested = git.gitlinks()
+    if nested:
+        issues.append(
+            "folders with their own .git (they'd sync as empty submodules): " + ", ".join(nested[:5])
+            + ". Delete their .git folder to share them as plain files"
+        )
+
+    if not allow_deletes:
+        deleted = [p for s, p in pairs if s == "D"]
+        before = git.tracked_at_head()
+        reasons = []
+        if len(deleted) > DELETE_LIMIT:
+            reasons.append(f"{len(deleted)} files")
+        if len(deleted) >= 3 and len(deleted) * 2 > len(before):
+            reasons.append(f"{len(deleted)} of {len(before)} files")
+        had, has = _entries_by_kind(before), _entries_by_kind(git.tracked())
+        for kind in CONTENT_KINDS:
+            gone = sorted(had[kind] - has[kind])
+            if len(gone) >= 2 and len(gone) * 2 > len(had[kind]):
+                reasons.append(f"{len(gone)} of {len(had[kind])} {kind} ({', '.join(gone[:3])})")
+        if reasons:
+            issues.append("large deletion: " + "; ".join(reasons))
+
     big = [f"{p} ({size / 1048576:.1f} MB)" for p, size in git.staged_sizes() if size > max_mb * 1048576]
     if big and not allow_large:
         issues.append("large files: " + ", ".join(big[:5]))
     return issues
 
 
+# ---- sync ---------------------------------------------------------------------------------------
+
+
 def _reload(ctx: Context, st: State) -> bool:
     try:
         ctx.reload()
+        ctx.load_error = None
         st.close_problem("repo")
         return True
     except AgentSyncError as exc:
-        st.open_problem("repo", str(exc))
+        ctx.load_error = str(exc)
+        _open_repo_problem(ctx, st)
         return False
 
 
+def _open_repo_problem(ctx: Context, st: State) -> None:
+    st.open_problem(
+        "repo",
+        f"{ctx.load_error} Until it's fixed this machine only fetches, so a fix pushed from any machine still lands here.",
+        f"Fix it in {ctx.paths.tilde(ctx.paths.repo_link)} and run `agent-sync`.",
+    )
+
+
 def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_large: bool = False) -> int:
-    st = State(ctx.paths.state_dir)
     with lock(ctx.paths.state_dir, wait=not quiet) as got:
         if not got:
             if not quiet:
                 print("agent-sync: another sync is running; try again in a moment.")
             return 0 if quiet else 1
+        st = State(ctx.paths.state_dir)  # read under the lock, so a waiting run never saves stale state
         lines: List[str] = []
+        failed = False
         try:
-            _sync(ctx, st, lines, allow_deletes, allow_large)
+            if ctx.load_error:
+                _recover(ctx, st, lines)
+            if not ctx.load_error:
+                _sync(ctx, st, lines, allow_deletes, allow_large)
+            st.close_problem("error")
+        except Exception as exc:  # any failure must become a visible problem, never a silent crash
+            failed = True
+            detail = str(exc) if isinstance(exc, (GitError, AgentSyncError, OSError)) else f"{type(exc).__name__}: {exc}"
+            hint = f"Run `agent-sync` to see it; the traceback is in {ctx.paths.tilde(ctx.paths.state_dir / 'sync.log')}."
+            if (ctx.repo / ".git" / "index.lock").exists():
+                hint = (f"A git process left {ctx.paths.tilde(ctx.paths.repo_link / '.git/index.lock')}. If no git is "
+                        "running there, delete it (agent-sync removes it itself once it is 10 minutes old). " + hint)
+            st.open_problem("error", f"Sync failed: {detail}", hint)
+            lines.append(f"! sync failed: {detail}")
+            log(ctx.paths.state_dir, "sync failed:\n" + traceback.format_exc())
         finally:
-            _notify(ctx, st)
+            try:
+                _notify(ctx, st)
+            except Exception as exc:
+                log(ctx.paths.state_dir, f"notify failed: {exc}")
             st.data["last_run"] = now()
             st.save()
             if lines:
@@ -154,7 +241,36 @@ def sync(ctx: Context, quiet: bool = False, allow_deletes: bool = False, allow_l
                 print(f"! {p['message']}" + (f"\n  {p['hint']}" if p.get("hint") else ""))
             if not lines and not st.problems:
                 print("up to date")
-        return 0
+        return 1 if failed else 0
+
+
+def _recover(ctx: Context, st: State, lines: List[str]) -> None:
+    """The repo's own config files don't load: only fetch and fast-forward, hoping a fix arrives."""
+    _open_repo_problem(ctx, st)
+    git = Git(ctx.repo, ctx.git_name, ctx.git_email)
+    if git.busy() or not git.has_remote() or git.dirty():
+        return
+    git.fetch()
+    branch = git.branch()
+    _, behind = git.ahead_behind(branch)
+    if not behind:
+        return
+    conflicted = git.rebase_onto_remote(branch)
+    if conflicted:
+        _open_conflict(ctx, st, conflicted)
+        return
+    lines.append(f"pulled {behind} change(s)")
+    _reload(ctx, st)
+
+
+def _clear_stale_index_lock(ctx: Context, git: Git, lines: List[str]) -> None:
+    lock_file = git.git_dir() / "index.lock"
+    try:
+        if now() - lock_file.stat().st_mtime > STALE_INDEX_LOCK:
+            lock_file.unlink()
+            lines.append("removed a stale .git/index.lock left by an interrupted git")
+    except FileNotFoundError:
+        pass
 
 
 def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_large: bool) -> None:
@@ -170,6 +286,7 @@ def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_
         )
         lines += apply(ctx, st, backups)
         return
+    _clear_stale_index_lock(ctx, git, lines)
 
     # 1. This machine's changes into the repo: adopt new skills, capture settings edits, commit.
     lines += apply(ctx, st, backups)
@@ -181,8 +298,8 @@ def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_
             st.open_problem(
                 "held",
                 "Local changes were NOT synced: " + " | ".join(issues) + ".",
-                "Remove secrets (put them in settings.local.json or an env var), or if the deletions/large files "
-                "are intended, run `agent-sync --allow-deletes` / `--allow-large`.",
+                "Fix what's listed (secrets belong in settings.local.json or an env var). If deletions or large "
+                "files are intended, run `agent-sync --allow-deletes` / `--allow-large`.",
             )
             return
         first = not git.has_commits()
@@ -199,17 +316,29 @@ def _sync(ctx: Context, st: State, lines: List[str], allow_deletes: bool, allow_
     except GitError as exc:
         st.data["last_error"] = str(exc)
         lines.append(f"remote unreachable, will retry: {exc}")
+        if not st.data.get("last_ok"):
+            st.open_problem(
+                "remote",
+                f"This machine has never reached its remote ({git.remote_url()}): {exc}.",
+                f"Check the URL (`git -C {ctx.paths.tilde(ctx.paths.repo_link)} remote -v`) and git credentials.",
+            )
         return
+    st.close_problem("remote")
     branch = git.branch()
-    _, behind = git.ahead_behind(branch)
+    ahead, behind = git.ahead_behind(branch)
     incoming = bool(behind)
-    if behind:
+    if (ahead or behind) and git.remote_branch_exists(branch):
+        # Also when only ahead: if the remote's history was rewritten (say, to purge a leaked secret),
+        # commits this machine already pushed now look "ahead"; the fork-point rebase drops them.
+        before = git.out("rev-parse", "HEAD")
         conflicted = git.rebase_onto_remote(branch)
         if conflicted:
             _open_conflict(ctx, st, conflicted)
             return
-        lines.append(f"pulled {behind} change(s)")
-        if not _reload(ctx, st):
+        if behind:
+            lines.append(f"pulled {behind} change(s)")
+        incoming = incoming or git.out("rev-parse", "HEAD") != before
+        if incoming and not _reload(ctx, st):
             return
     st.close_problem("conflict")
 
@@ -278,4 +407,4 @@ def _notify(ctx: Context, st: State) -> None:
         if ok:
             st.data["notified"][key] = now()
         else:
-            log(ctx.paths.state_dir, f"notify command failed for {key}: {detail}")
+            log(ctx.paths.state_dir, f"notify failed for {key}: {detail}")

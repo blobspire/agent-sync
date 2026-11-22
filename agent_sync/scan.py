@@ -31,8 +31,11 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
     ),
 ]
 
-# Environment variable names that hold secrets even when the value has no recognizable shape.
-SECRET_NAME = re.compile(r"(?i)(token|secret|passw(or)?d|api_?key|private_?key|credential)")
+# Environment variable names that hold secrets even when the value has no recognizable shape. Anchored
+# at the end so settings like MAX_THINKING_TOKENS or CLAUDE_CODE_MAX_OUTPUT_TOKENS don't count.
+SECRET_NAME = re.compile(
+    r"(?i)(^|_)(token|secret|passw(or)?d|pass|api_?key|access_?key|private_?key|credentials?|auth)$"
+)
 
 
 def find(text: str) -> List[str]:
@@ -66,12 +69,23 @@ def scan_added_lines(diff_text: str) -> List[str]:
 def is_secret_setting(path: Iterable[str], value: object) -> bool:
     """Whether a settings.json leaf should stay local instead of being committed.
 
-    Any value with a known secret shape counts. A name like *_TOKEN counts only inside "env", so keys
-    such as "apiKeyHelper" (a command path) are not mistaken for secrets.
+    Any value containing a known secret shape counts. A name ending in _TOKEN, _API_KEY etc. counts only
+    inside "env", so keys such as "apiKeyHelper" (a command path) are not mistaken for secrets.
     """
     path = list(path)
-    if isinstance(value, str) and find(value):
+    # Same patterns as the commit-time scan, so anything that would hold a commit stays local instead.
+    if any(find(s) for s in _strings(value)):
         return True
-    if isinstance(value, list) and any(isinstance(v, str) and find(v) for v in value):
-        return True
-    return len(path) >= 2 and path[-2] == "env" and bool(SECRET_NAME.search(path[-1]))
+    return len(path) >= 2 and path[-2] == "env" and bool(SECRET_NAME.search(str(path[-1])))
+
+
+def _strings(value: object) -> Iterable[str]:
+    """Every string inside a value, however deeply nested (hook commands live in lists of dicts)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for v in value:
+            yield from _strings(v)
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _strings(v)

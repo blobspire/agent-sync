@@ -15,8 +15,9 @@ NETWORK_TIMEOUT = 120
 class GitError(Exception):
     def __init__(self, args: List[str], result: subprocess.CompletedProcess):
         self.result = result
-        out = (result.stderr or result.stdout or "").strip().splitlines()
-        super().__init__(f"git {' '.join(args)} failed: {out[-1] if out else 'exit ' + str(result.returncode)}")
+        out = [l.strip() for l in (result.stderr or result.stdout or "").strip().splitlines() if l.strip()]
+        detail = " ".join(out)[:400] if out else f"exit {result.returncode}"
+        super().__init__(f"git {' '.join(args)} failed: {detail}")
 
 
 class Git:
@@ -58,9 +59,12 @@ class Git:
     def remote_url(self) -> str:
         return self.run("remote", "get-url", "origin", check=False).stdout.strip()
 
+    def git_dir(self) -> Path:
+        return Path(self.out("rev-parse", "--absolute-git-dir"))
+
     def busy(self) -> Optional[str]:
         """A rebase or merge left in progress (by a person, or a crash), or None."""
-        git_dir = Path(self.out("rev-parse", "--absolute-git-dir"))
+        git_dir = self.git_dir()
         for name, what in (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge")):
             if (git_dir / name).exists():
                 return what
@@ -81,8 +85,23 @@ class Git:
     def dirty(self) -> List[str]:
         return [l for l in self.out("status", "--porcelain").splitlines() if l.strip()]
 
-    def tracked_count(self) -> int:
-        return len([l for l in self.out("ls-files").splitlines() if l])
+    def tracked(self) -> List[str]:
+        """Paths in the index (after stage_all: what the next commit will contain)."""
+        return [l for l in self.out("ls-files").splitlines() if l]
+
+    def tracked_at_head(self) -> List[str]:
+        if not self.has_commits():
+            return []
+        return [l for l in self.out("ls-tree", "-r", "--name-only", "HEAD").splitlines() if l]
+
+    def gitlinks(self) -> List[str]:
+        """Staged paths that are nested git repositories (mode 160000), which git stores as empty links."""
+        out = []
+        for line in self.out("ls-files", "-s").splitlines():
+            meta, _, path = line.partition("\t")
+            if meta.startswith("160000"):
+                out.append(path)
+        return out
 
     # ---- changes --------------------------------------------------------------------------------
 
@@ -122,13 +141,20 @@ class Git:
         self.run("fetch", "-q", "origin", timeout=NETWORK_TIMEOUT)
 
     def rebase_onto_remote(self, branch: str) -> Optional[List[str]]:
-        """Rebase local commits onto origin/<branch>. Returns conflicted paths (rebase aborted) or None."""
-        result = self.run("rebase", "-q", f"origin/{branch}", check=False, timeout=NETWORK_TIMEOUT)
+        """Rebase local commits onto origin/<branch>. Returns conflicted paths (rebase aborted) or None.
+
+        --fork-point (what `git pull --rebase` does) uses the remote-tracking reflog, so commits that were
+        already pushed and then removed from the remote by a history rewrite are not replayed and re-pushed.
+        """
+        result = self.run("rebase", "-q", "--fork-point", f"origin/{branch}", check=False, timeout=NETWORK_TIMEOUT)
         if result.returncode == 0:
             return None
         conflicted = self.run("diff", "--name-only", "--diff-filter=U", check=False).stdout.split()
-        self.run("rebase", "--abort", check=False)
-        return conflicted or ["(unknown files)"]
+        if self.busy():
+            self.run("rebase", "--abort", check=False)
+        if not conflicted:  # refused to start (dirty tree, bad ref...): an error, not a conflict
+            raise GitError(["rebase", f"origin/{branch}"], result)
+        return conflicted
 
     def push(self, branch: str) -> bool:
         """Push; False if the remote moved on (someone else pushed first)."""

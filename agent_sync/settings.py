@@ -26,7 +26,12 @@ HOOK_MARK = "hook session-start"
 
 
 class Unreadable(Exception):
-    pass
+    """A settings file that must be read (settings.json, base.json, the local secrets) isn't valid JSON."""
+
+    def __init__(self, path: Path, detail: str):
+        self.path = Path(path)
+        self.detail = detail
+        super().__init__(f"{path}: {detail}")
 
 
 # ---- paths --------------------------------------------------------------------------------------
@@ -53,31 +58,35 @@ def read_current(ctx: Context) -> Optional[dict]:
     try:
         data = jsonutil.load(settings_path(ctx), None)
     except ValueError as exc:
-        raise Unreadable(str(exc))
+        raise Unreadable(settings_path(ctx), str(exc))
     if data is not None and not isinstance(data, dict):
-        raise Unreadable("top level is not an object")
+        raise Unreadable(settings_path(ctx), "top level is not an object")
     return data
 
 
 def _load(path: Path) -> dict:
+    """A settings source: missing means empty, but a broken file is an error. Treating it as empty would
+    silently drop every shared setting (permissions and hooks included) on every machine."""
     try:
         data = jsonutil.load(path, {}) or {}
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
+    except ValueError as exc:
+        raise Unreadable(path, str(exc))
+    if not isinstance(data, dict):
+        raise Unreadable(path, "top level is not an object")
+    return data
 
 
 # ---- agent-sync's own SessionStart hook ---------------------------------------------------------
 
 
+def _is_tool_hook_object(hook: Any) -> bool:
+    cmd = hook.get("command", "") if isinstance(hook, dict) else ""
+    return isinstance(cmd, str) and "agent-sync" in cmd and HOOK_MARK in cmd
+
+
 def _is_tool_hook(entry: Any) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    for hook in entry.get("hooks", []) or []:
-        cmd = hook.get("command", "") if isinstance(hook, dict) else ""
-        if "agent-sync" in cmd and HOOK_MARK in cmd:
-            return True
-    return False
+    hooks = entry.get("hooks") if isinstance(entry, dict) else None
+    return isinstance(hooks, list) and any(_is_tool_hook_object(h) for h in hooks)
 
 
 def add_tool_hook(settings: dict, ctx: Context) -> dict:
@@ -100,7 +109,15 @@ def strip_tool_hook(settings: dict) -> dict:
     out = copy.deepcopy(settings)
     hooks = out.get("hooks")
     if isinstance(hooks, dict) and isinstance(hooks.get("SessionStart"), list):
-        kept = [e for e in hooks["SessionStart"] if not _is_tool_hook(e)]
+        kept = []
+        for entry in hooks["SessionStart"]:
+            if _is_tool_hook(entry):
+                # Remove only agent-sync's hook; anything someone added next to it in the same entry stays.
+                rest = [h for h in entry["hooks"] if not _is_tool_hook_object(h)]
+                if rest:
+                    kept.append(dict(entry, hooks=rest))
+            else:
+                kept.append(entry)
         if kept:
             hooks["SessionStart"] = kept
         else:
@@ -156,18 +173,16 @@ def _set_overlay(ctx: Context, target: dict, save: bool = True) -> None:
         ctx.save_hostfile()
 
 
-def _add_local(ctx: Context, secrets: dict) -> None:
-    if secrets:
-        jsonutil.save(local_path(ctx), jsonutil.merge(_load(local_path(ctx)), secrets), mode=0o600)
-
-
 def capture(ctx: Context, dry_run: bool = False) -> List[str]:
     """Fold changes made to settings.json since agent-sync last wrote it into this host's overlay.
 
     Returns the dotted paths that changed. Raises Unreadable if settings.json is mid-edit or broken.
     """
     current = read_current(ctx)
-    last = jsonutil.load(last_path(ctx), None) if last_path(ctx).exists() else None
+    try:
+        last = jsonutil.load(last_path(ctx), None)
+    except ValueError:
+        last = None  # corrupt record of the last write: regenerate (with a backup) instead of guessing
     if current is None or not isinstance(last, dict):
         return []
     cur, prev = strip_tool_hook(current), strip_tool_hook(last)
@@ -177,11 +192,49 @@ def capture(ctx: Context, dry_run: bool = False) -> List[str]:
     if dry_run:
         return jsonutil.leaf_paths(delta)
     shared, secret = split_secrets(delta)
-    _add_local(ctx, secret)
+    # Every value the delta touches is decided afresh: a secret that was deleted or replaced by a plain
+    # value must leave the local file, or it would be merged back in on every sync.
+    local = _load(local_path(ctx))
+    for path, _ in _leaves(delta):
+        _drop(local, path)
+    local = jsonutil.merge(local, secret)
+    if local:
+        jsonutil.save(local_path(ctx), local, mode=0o600)
+    else:
+        local_path(ctx).unlink(missing_ok=True)
     if shared:
         placeholder_delta = jsonutil.unsubstitute(shared, ctx.placeholders())
         _set_overlay(ctx, jsonutil.merge(effective(ctx), placeholder_delta))
     return jsonutil.leaf_paths(delta)
+
+
+def _leaves(obj: Any, prefix: Tuple[str, ...] = ()):
+    """(path, value) for each leaf of an overlay: non-dicts, None and empty dicts."""
+    if isinstance(obj, dict) and obj:
+        for key, value in obj.items():
+            yield from _leaves(value, prefix + (key,))
+    else:
+        yield prefix, obj
+
+
+def _drop(obj: dict, path: Tuple[str, ...]) -> None:
+    """Delete `path` from nested dicts in place, removing parents it leaves empty."""
+    if not path:
+        return
+    trail = []
+    node: Any = obj
+    for key in path[:-1]:
+        if not isinstance(node, dict) or key not in node:
+            return
+        trail.append((node, key))
+        node = node[key]
+    if isinstance(node, dict):
+        node.pop(path[-1], None)
+    for parent, key in reversed(trail):
+        if isinstance(parent[key], dict) and not parent[key]:
+            del parent[key]
+        else:
+            break
 
 
 def adopt(ctx: Context, save: bool = True) -> dict:
