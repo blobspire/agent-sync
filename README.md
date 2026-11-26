@@ -83,7 +83,7 @@ keeps the local version instead). [SETUP.md](SETUP.md) walks an agent through al
 |---|---|
 | `agent-sync` | Sync now (what the timer runs, and what agents run after editing); `--allow-deletes`, `--allow-large`, `--accept-rewrite` release a held sync |
 | `agent-sync status` | Last sync, local/remote state, timer, open problems |
-| `agent-sync doctor` | Check links, settings, the remote, referenced commands, plugins, `requires` |
+| `agent-sync doctor` | Check links, settings, the remote, referenced commands, plugins, `requires`; warn about settings that name another machine's home, note links and INDEX entries that point nowhere, project memories that duplicate a shared note, and an always-loaded instruction set over 200 lines |
 | `agent-sync apply [--dry-run]` | Update `~/.claude` from the repo without touching git |
 | `agent-sync settings show [--host H]` | This machine's generated settings, or another host's |
 | `agent-sync settings factor` | Move settings identical on every host into `base.json` (no host changes) |
