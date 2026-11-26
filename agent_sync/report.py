@@ -184,7 +184,7 @@ def doctor(ctx: Context) -> Tuple[bool, str]:
         if foreign:
             shown = "; ".join(f"{key}: {p}" for key, p in foreign[:5]) + (" …" if len(foreign) > 5 else "")
             add("warn", "settings from another machine?",
-                f"{len(foreign)} home path(s) that aren't {ctx.paths.tilde(ctx.paths.home)} ({shown}); "
+                f"{len(foreign)} home path(s) that aren't this machine's ({ctx.paths.home}): {shown}; "
                 "use {{HOME}}, or remove text copied from another computer")
         plugins_file = ctx.paths.claude / "plugins" / "installed_plugins.json"
         installed = (jsonutil.load(plugins_file, {}) or {}).get("plugins", {}) if plugins_file.exists() else {}
