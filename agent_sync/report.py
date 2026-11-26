@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Iterator, List, Tuple
 
-from . import VERSION, claudemd, jsonutil, links, settings, timer
+from . import VERSION, claudemd, jsonutil, links, lint, settings, timer
 from .context import AgentSyncError, Context, Paths
 from .gitops import Git, GitError
 from .state import State, now, stamp
@@ -108,6 +108,41 @@ def _missing_paths(command: str) -> List[str]:
     return [t for t in tokens if t.startswith("/") and not Path(t).exists()]
 
 
+def _instruction_checks(ctx: Context, doc: Path, add) -> None:
+    """Warnings about the shared instructions themselves. Read-only."""
+    dangling = lint.dangling_links(ctx.repo)
+    missing, unlisted = lint.index_problems(ctx.repo)
+    problems = []
+    if dangling:
+        problems.append(f"{len(dangling)} [[link]](s) to no note (" +
+                        ", ".join(f"{f} → {t}" for f, t in dangling[:4]) + (" …" if len(dangling) > 4 else "") + ")")
+    if missing:
+        problems.append("INDEX lists missing file(s): " + ", ".join(missing[:6]))
+    if unlisted:
+        problems.append("note(s) not in INDEX: " + ", ".join(unlisted[:6]))
+    if problems:
+        add("warn", "notes", "; ".join(problems))
+    elif lint.note_names(ctx.repo):
+        add("ok", "notes", f"{len(lint.note_names(ctx.repo))} notes, all indexed, links resolve")
+
+    dupes = lint.duplicate_memories(ctx.paths.claude, ctx.repo)
+    if dupes:
+        same = sum(1 for _, _, s in dupes if s)
+        add("warn", "project memories duplicate notes",
+            f"{len(dupes)} ({same} identical, {len(dupes) - same} drifted), e.g. {dupes[0][0]}; "
+            "delete the project copy once the shared note covers it")
+
+    loaded = [doc, ctx.repo / "CLAUDE.md", ctx.repo / "notes" / "INDEX.md", ctx.host_md]
+    lines, size, per_file = lint.always_loaded(loaded)
+    detail = f"{lines} lines, ~{size // 4} tokens (" + ", ".join(
+        f"{ctx.paths.tilde(f)} {c}" for f, c in per_file) + ")"
+    if lines > lint.ALWAYS_LOADED_LINE_LIMIT:
+        add("warn", "always-loaded instructions", detail + f"; over {lint.ALWAYS_LOADED_LINE_LIMIT} lines: "
+            "move what most sessions don't need into notes, skills or host files")
+    else:
+        add("ok", "always-loaded instructions", detail)
+
+
 def doctor(ctx: Context) -> Tuple[bool, str]:
     checks: List[Tuple[str, str, str]] = []  # (level, what, detail)
 
@@ -145,6 +180,12 @@ def doctor(ctx: Context) -> Tuple[bool, str]:
         missing = sorted({m for c in _commands_in(gen) for m in _missing_paths(c)})
         if missing:
             add("fail", "hook/statusLine commands", "missing on this machine: " + ", ".join(missing))
+        foreign = lint.foreign_home_paths(gen, str(ctx.paths.home), allowed=[ctx.command])
+        if foreign:
+            shown = "; ".join(f"{key}: {p}" for key, p in foreign[:5]) + (" …" if len(foreign) > 5 else "")
+            add("warn", "settings from another machine?",
+                f"{len(foreign)} home path(s) that aren't {ctx.paths.tilde(ctx.paths.home)} ({shown}); "
+                "use {{HOME}}, or remove text copied from another computer")
         plugins_file = ctx.paths.claude / "plugins" / "installed_plugins.json"
         installed = (jsonutil.load(plugins_file, {}) or {}).get("plugins", {}) if plugins_file.exists() else {}
         wanted = [p for p, on in (gen.get("enabledPlugins") or {}).items() if on]
@@ -163,6 +204,7 @@ def doctor(ctx: Context) -> Tuple[bool, str]:
         add("warn", "CLAUDE.md", "no agent-sync block yet (next sync adds it)")
     if claudemd.outside_text(text):
         add("warn", "CLAUDE.md", "has text outside managed blocks that won't sync")
+    _instruction_checks(ctx, doc, add)
 
     for req in ctx.hostfile.get("requires", []) or []:
         name = req.get("command") or req.get("path", "")

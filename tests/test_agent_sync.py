@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENTRY = ROOT / "agent-sync"
 sys.path.insert(0, str(ROOT))
 
-from agent_sync import claudemd, jsonutil, scan, timer  # noqa: E402
+from agent_sync import claudemd, jsonutil, lint, scan, timer  # noqa: E402
 
 ID = ["--git-name", "Test User", "--git-email", "test@example.com"]
 OLD = time.time() - 3600
@@ -957,6 +957,96 @@ class SecretNameTest(unittest.TestCase):
             self.assertTrue(scan.is_secret_setting(["env", name], "x"), name)
         for name in self.SHARED:
             self.assertFalse(scan.is_secret_setting(["env", name], "x"), name)
+
+
+class LintTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agent-sync-lint-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def note(self, name: str, text: str) -> None:
+        p = self.tmp / "repo" / "notes" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def test_foreign_home_paths(self):
+        settings = {
+            "statusLine": {"command": "/home/someone/bin/status"},
+            "autoMode": {"environment": ["repo at /Users/other/code", "mine at /home/me/code",
+                                         "see https://example.com/home/x and ~/home/y"]},
+            "env": {"OWN": "/home/me"},
+        }
+        self.assertEqual(lint.foreign_home_paths(settings, "/home/me"),
+                         [("statusLine.command", "/home/someone"), ("autoMode.environment[0]", "/Users/other")])
+        self.assertEqual(lint.foreign_home_paths({"x": "/home/me/a /home/me/b"}, "/home/me/"), [])
+        tool = "/Users/dev/src/agent-sync/agent-sync"
+        self.assertEqual(lint.foreign_home_paths({"hook": f"{tool} hook session-start"}, "/home/me",
+                                                 allowed=[tool]), [])
+
+    def test_note_links_and_index(self):
+        self.note("a.md", "see [[b]] and [[gone]] and `[[code-example]]`\n")
+        self.note("b.md", "plain\n")
+        self.note("INDEX.md", "One line per note: `- [Title](file.md)`\n- [A](a.md) — x\n- [M](missing.md) — y\n")
+        repo = self.tmp / "repo"
+        self.assertEqual(lint.note_names(repo), ["a", "b"])
+        self.assertEqual(lint.dangling_links(repo), [("a.md", "gone")])
+        self.assertEqual(lint.index_problems(repo), (["missing.md"], ["b.md"]))
+
+    def test_duplicate_memories(self):
+        self.note("a.md", "same\n")
+        self.note("b.md", "shared copy\n")
+        mem = self.tmp / "claude" / "projects" / "p" / "memory"
+        mem.mkdir(parents=True)
+        (mem / "a.md").write_text("same\n")
+        (mem / "b.md").write_text("drifted copy\n")
+        (mem / "MEMORY.md").write_text("- [a](a.md)\n")
+        (mem / "own.md").write_text("project only\n")
+        self.assertEqual(lint.duplicate_memories(self.tmp / "claude", self.tmp / "repo"),
+                         [("p/memory/a.md", "a.md", True), ("p/memory/b.md", "b.md", False)])
+
+    def test_always_loaded(self):
+        f1, f2 = self.tmp / "one.md", self.tmp / "two.md"
+        f1.write_text("a\nb\n")
+        f2.write_text("c")
+        lines, size, per_file = lint.always_loaded([f1, f2, self.tmp / "absent.md"])
+        self.assertEqual((lines, size), (3, 5))
+        self.assertEqual(per_file, [(f1, 2), (f2, 1)])
+
+
+class DoctorInstructionChecks(Base):
+    def doctor(self) -> str:
+        return self.a.run("doctor", ok=False).stdout
+
+    def test_warns_on_decay_and_is_quiet_when_clean(self):
+        a = self.a
+        # control: a clean setup gets ok lines and none of the new warnings
+        a.write(".local/share/agent-config/notes/fact.md", "a fact\n")
+        a.write(".local/share/agent-config/notes/INDEX.md", "- [Fact](fact.md) — when\n")
+        out = self.doctor()
+        self.assertIn("ok    notes: 1 notes, all indexed, links resolve", out)
+        self.assertIn("ok    always-loaded instructions", out)
+        for warning in ("settings from another machine", "WARN  notes", "duplicate notes"):
+            self.assertNotIn(warning, out)
+
+        # each kind of decay turns its check into a warning
+        a.write(".local/share/agent-config/notes/fact.md", "a fact, see [[nowhere]]\n")
+        a.write(".local/share/agent-config/notes/stray.md", "not indexed\n")
+        a.write(".claude/projects/p/memory/fact.md", "an older copy\n")
+        foreign = "/Users/nobody" if not str(a.home).startswith("/Users/nobody") else "/home/nobody"
+        a.set_settings(dict(a.settings(), env={"X": "1", "SRC": f"{foreign}/code"}))
+        a.run()
+        a.write(".local/share/agent-config/notes/INDEX.md",
+                "- [Fact](fact.md) — when\n" + "".join(f"- line {i}\n" for i in range(lint.ALWAYS_LOADED_LINE_LIMIT)))
+        out = self.doctor()
+        self.assertIn(f"env.SRC: {foreign}", out)
+        self.assertIn("fact.md → nowhere", out)
+        self.assertIn("note(s) not in INDEX: stray.md", out)
+        self.assertIn("project memories duplicate notes: 1 (0 identical, 1 drifted)", out)
+        self.assertIn("WARN  always-loaded instructions", out)
+        # these checks only warn: none of them may turn doctor into a failure
+        self.assertNotRegex(out, r"FAIL  (notes|settings from another|project memories|always-loaded)")
 
 
 if __name__ == "__main__":
